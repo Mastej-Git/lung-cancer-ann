@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "lung-cancer-ann"
+version = "0.1.0"
+description = ""
+authors = [
+    "Michał Mastej <m.mastej1812@gmail.com>",
+    "Szymon Rutkowski <>"
+]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+
+numpy = "<2.2.0"
+matplotlib = "3.10.0"
+opencv-python = "^4.11.0"
+scikit-learn = "1.6.0"
+tensorflow = "^2.16.1"
+keras = "3.0.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
