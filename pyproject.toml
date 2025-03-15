@@ -17,6 +17,7 @@ opencv-python = "^4.11.0"
 scikit-learn = "1.6.0"
 tensorflow = "^2.16.1"
 keras = "3.0.0"
+pandas = "^2.2.0"
 
 [build-system]
 requires = ["poetry-core"]
