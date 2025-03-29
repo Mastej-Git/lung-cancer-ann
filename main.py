@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import tensorflow as tf
 from tensorflow import keras
 from keras import layers
+from keras.callbacks import EarlyStopping, ReduceLROnPlateau
 
 from sklearn.model_selection import train_test_split
 from sklearn import metrics
@@ -40,31 +41,55 @@ def show_example_pics():
         plt.show()
 
 
-def prepare_data():
-    IMG_SIZE = 256
-    SPLIT = 0.2
+# def prepare_data():
+#     IMG_SIZE = 256
+#     SPLIT = 0.2
 
-    x, y = [], []
+#     x, y = [], []
 
-    catalogs = sorted(os.listdir(PATH))
-    for i, catalog in enumerate(catalogs):
-        images = glob(f"{PATH}/{catalog}/*.jpeg")
+#     catalogs = sorted(os.listdir(PATH))
+#     for i, catalog in enumerate(catalogs):
+#         images = glob(f"{PATH}/{catalog}/*.jpeg")
 
-        for image in images:
-            img = cv2.imread(image)
+#         for image in images:
+#             img = cv2.imread(image)
 
-            x.append(cv2.resize(img, (IMG_SIZE, IMG_SIZE)) / 255.0)
-            y.append(i)
+#             x.append(cv2.resize(img, (IMG_SIZE, IMG_SIZE)) / 255.0)
+#             y.append(i)
 
-    x = np.asarray(x)
-    one_hot_encoded_y = pd.get_dummies(y).values
+#     x = np.asarray(x)
+#     one_hot_encoded_y = pd.get_dummies(y).values
 
-    x_train, x_val, y_train, y_val = train_test_split(
-        x, one_hot_encoded_y, test_size=SPLIT, random_state=2022
-    )
-    return x_train, x_val, y_train, y_val
+#     x_train, x_val, y_train, y_val = train_test_split(
+#         x, one_hot_encoded_y, test_size=SPLIT, random_state=2022
+#     )
+#     return x_train, x_val, y_train, y_val
 
 IMG_SIZE = 256
+SPLIT = 0.2
+EPOCHS = 10
+BATCH_SIZE = 64
+
+x, y = [], []
+
+catalogs = sorted(os.listdir(PATH))
+for i, catalog in enumerate(catalogs):
+    images = glob(f"{PATH}/{catalog}/*.jpeg")
+
+    for image in images:
+        img = cv2.imread(image)
+
+        x.append(cv2.resize(img, (IMG_SIZE, IMG_SIZE)) / 255.0)
+        y.append(i)
+
+x = np.asarray(x)
+one_hot_encoded_y = pd.get_dummies(y).values
+
+x_train, x_val, y_train, y_val = train_test_split(
+    x, one_hot_encoded_y, test_size=SPLIT, random_state=2022
+)
+
+
 model = keras.models.Sequential([
     layers.Conv2D(filters=32,
                   kernel_size=(5, 5),
@@ -105,5 +130,31 @@ model.compile(
     loss = 'categorical_crossentropy',
     metrics = ['accuracy']
 )
+
+class myCallback(keras.callbacks.Callback):
+    def on_epoch_end(self, epoch, logs={}):
+        if logs.get('val_accuracy') > 0.9:
+            print('\n Validation accuracy has reached up to 90%, stopping further trainning')
+            self.model.stop_training = True
+
+es = EarlyStopping(patience=3,
+                   monitor='val_accuracy',
+                   restore_best_weights=True)
+
+lr = ReduceLROnPlateau(monitor='val_loss',
+                       patience=2,
+                       factor=0.5,
+                       varbose=1)
+
+history = model.fit(x_train, y_train,
+                    validation_data = (x_val, y_val),
+                    batch_size = BATCH_SIZE,
+                    epochs = EPOCHS,
+                    verbose = 1,
+                    callbacks = [es, lr, myCallback()])
+
+history_df = pd.DataFrame(history.history)
+history_df.loc[:,['accuracy', 'val_accuracy']].plot()
+plt.show()
 
 # prepare_data()
