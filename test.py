@@ -10,7 +10,8 @@ import matplotlib.pyplot as plt
 import tensorflow as tf
 from tensorflow import keras
 from keras import layers
-from keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint, LearningRateScheduler
+from tensorflow.keras import regularizers
 
 from sklearn.model_selection import train_test_split
 from sklearn import metrics
@@ -120,37 +121,63 @@ def prepare_data():
 
 def build_model():
     """Build the CNN model."""
-    model = keras.models.Sequential([
-        layers.Conv2D(filters=32,
-                    kernel_size=(5, 5),
-                    activation='relu',
-                    input_shape=(IMG_SIZE, IMG_SIZE, 3),
-                    padding='same'),
-        layers.MaxPooling2D(2, 2),
+    # model = keras.models.Sequential([
+    #     layers.Conv2D(filters=32,
+    #                 kernel_size=(5, 5),
+    #                 activation='relu',
+    #                 input_shape=(IMG_SIZE, IMG_SIZE, 3),
+    #                 padding='same',
+    #                 kernel_regularizer=regularizers.l2(0.0001)),
+    #     layers.BatchNormalization(),
+    #     layers.MaxPooling2D(2, 2),
 
-        layers.Conv2D(filters=64,
-                    kernel_size=(3, 3),
-                    activation='relu',
-                    padding='same'),
-        layers.MaxPooling2D(2, 2),
+    #     layers.Conv2D(filters=64,
+    #                 kernel_size=(3, 3),
+    #                 activation='relu',
+    #                 padding='same',
+    #                 kernel_regularizer=regularizers.l2(0.0001)),
+    #     layers.BatchNormalization(),
+    #     layers.MaxPooling2D(2, 2),
 
-        layers.Conv2D(filters=128,
-                    kernel_size=(3, 3),
-                    activation='relu',
-                    padding='same'),
-        layers.MaxPooling2D(2, 2),
+    #     layers.Conv2D(filters=128,
+    #                 kernel_size=(3, 3),
+    #                 activation='relu',
+    #                 padding='same',
+    #                 kernel_regularizer=regularizers.l2(0.0001)),
+    #     layers.BatchNormalization(),
+    #     layers.MaxPooling2D(2, 2),
 
-        layers.Flatten(),
-        layers.Dense(256, activation='relu'),
-        layers.BatchNormalization(),
-        layers.Dense(128, activation='relu'),
-        layers.Dropout(0.3),
-        layers.BatchNormalization(),
-        layers.Dense(3, activation='softmax')  # Ensure this matches the number of classes
-    ])
+    #     layers.Flatten(),
+    #     layers.Dense(256, activation='relu'),
+    #     layers.BatchNormalization(),
+    #     layers.Dense(128, activation='relu'),
+    #     layers.Dropout(0.3),
+    #     layers.BatchNormalization(),
+    #     layers.Dense(3, activation='softmax')  # Ensure this matches the number of classes
+    # ])
     
+    model = keras.models.Sequential([
+        layers.Conv2D(32, (3, 3), activation='relu', padding='same', 
+                     input_shape=(IMG_SIZE, IMG_SIZE, 3), kernel_regularizer=regularizers.l2(0.0001)),
+        layers.BatchNormalization(),
+        layers.MaxPooling2D(2, 2),
+        
+        layers.Conv2D(64, (3, 3), activation='relu', padding='same', kernel_regularizer=regularizers.l2(0.0001)),
+        layers.BatchNormalization(),
+        layers.MaxPooling2D(2, 2),
+        
+        layers.Flatten(),
+        layers.Dense(128, activation='relu'),
+        layers.BatchNormalization(),
+        layers.Dropout(0.5),  # Increased dropout
+        layers.Dense(3, activation='softmax')
+    ])
+
     model.compile(
-        optimizer='adam',
+        optimizer=keras.optimizers.Adam(
+            learning_rate=0.0001,
+            clipnorm=1.0,
+        ),
         loss='categorical_crossentropy',
         metrics=['accuracy']
     )
@@ -169,6 +196,11 @@ class AccuracyCallback(keras.callbacks.Callback):
         if val_accuracy is not None and val_accuracy > self.threshold:
             print(f'\nValidation accuracy reached {val_accuracy:.4f}, stopping training')
             self.model.stop_training = True
+
+def lr_schedule(epoch, lr):
+    if epoch > 5:
+        return lr * 0.5
+    return lr
 
 def main():
     """Main function to run the training pipeline."""
@@ -199,6 +231,14 @@ def main():
         factor=0.5,
         verbose=1
     )
+    checkpoint = ModelCheckpoint(
+        'best_model.keras',
+        monitor='val_accuracy',
+        save_best_only=True,
+        mode='max',
+        verbose=1
+    )
+    lr_scheduler = LearningRateScheduler(lr_schedule)
     
     # Train model
     print("Starting training...")
@@ -208,7 +248,7 @@ def main():
             validation_data=val_dataset,
             epochs=EPOCHS,
             verbose=1,
-            callbacks=[early_stopping, reduce_lr, accuracy_callback]
+            callbacks=[early_stopping, reduce_lr, accuracy_callback, checkpoint, lr_scheduler]
         )
         
         # Plot results
@@ -218,8 +258,12 @@ def main():
         plt.xlabel('Epoch')
         plt.ylabel('Accuracy')
         plt.legend(['Train', 'Validation'], loc='upper left')
-        plt.savefig('model_accuracy.png')
+        plt.savefig('model_accuracy_plots_new/model_accuracy.png')
         plt.show()
+
+        print("\nTraining Results:")
+        print(f"Final training accuracy: {history.history['accuracy'][-1]:.4f}")
+        print(f"Final validation accuracy: {history.history['val_accuracy'][-1]:.4f}")
         
         # Save model
         model.save('lung_image_classifier.keras')
