@@ -35,46 +35,88 @@ SPLIT = 0.2
 EPOCHS = 10
 BATCH_SIZE = 16  # Smaller batch size
 
-# Generator function to load images in batches
-def image_generator(image_paths, labels, batch_size=16):
-    num_samples = len(image_paths)
-    while True:
-        # Shuffle at the beginning of each epoch
-        indices = np.random.permutation(num_samples)
+# Create a custom data generator that supports class weights
+class BalancedDataGenerator(tf.keras.utils.Sequence):
+    def __init__(self, image_paths, labels, batch_size=16, augment=False):
+        self.image_paths = image_paths
+        self.labels = labels
+        self.batch_size = batch_size
+        self.augment = augment
+        self.indices = np.arange(len(image_paths))
         
-        for start_idx in range(0, num_samples, batch_size):
-            end_idx = min(start_idx + batch_size, num_samples)
-            batch_indices = indices[start_idx:end_idx]
+        # Calculate class weights internally
+        self.class_counts = np.sum(labels, axis=0)
+        self.class_weights = np.sum(self.class_counts) / (len(self.class_counts) * self.class_counts)
+        self.sample_weights = np.zeros(len(labels))
+        
+        # Assign weight to each sample based on its class
+        for i in range(len(labels)):
+            class_idx = np.argmax(labels[i])
+            self.sample_weights[i] = self.class_weights[class_idx]
             
-            batch_images = []
-            batch_labels = []
+        # Normalize sample weights
+        self.sample_weights = self.sample_weights / np.sum(self.sample_weights) * len(self.sample_weights)
+        
+        # Shuffle on initialization
+        np.random.shuffle(self.indices)
+    
+    def __len__(self):
+        return int(np.ceil(len(self.image_paths) / self.batch_size))
+    
+    def __getitem__(self, idx):
+        # Get batch indices with weighted sampling
+        if idx == 0:  # Shuffle on epoch start
+            p = self.sample_weights / np.sum(self.sample_weights)
+            self.indices = np.random.choice(
+                len(self.image_paths), 
+                size=len(self.image_paths), 
+                replace=False, 
+                p=p
+            )
             
-            for idx in batch_indices:
-                try:
-                    img = cv2.imread(image_paths[idx])
-                    if img is None:
-                        continue
-                    
-                    img_resized = cv2.resize(img, (IMG_SIZE, IMG_SIZE)) / 255.0
-                    batch_images.append(img_resized)
-                    batch_labels.append(labels[idx])
-                except Exception as e:
-                    print(f"Error processing image {image_paths[idx]}: {e}")
+        # Get specific batch indices
+        batch_indices = self.indices[idx * self.batch_size:min((idx + 1) * self.batch_size, len(self.image_paths))]
+        
+        batch_images = []
+        batch_labels = []
+        
+        for i in batch_indices:
+            try:
+                img = cv2.imread(self.image_paths[i])
+                if img is None:
                     continue
+                
+                img_resized = cv2.resize(img, (IMG_SIZE, IMG_SIZE)) / 255.0
+                
+                # Apply augmentation if needed
+                if self.augment:
+                    if np.random.random() > 0.5:
+                        img_resized = cv2.flip(img_resized, 1)  # Horizontal flip
+                    
+                    if np.random.random() > 0.5:
+                        img_resized = cv2.flip(img_resized, 0)  # Vertical flip
+                        
+                    # Random brightness
+                    if np.random.random() > 0.5:
+                        brightness = np.random.uniform(0.8, 1.2)
+                        img_resized = np.clip(img_resized * brightness, 0, 1)
+                
+                batch_images.append(img_resized)
+                batch_labels.append(self.labels[i])
+            except Exception as e:
+                print(f"Error processing image {self.image_paths[i]}: {e}")
+                continue
+        
+        if not batch_images:  # Handle empty batch case
+            # Return a minimal valid batch to avoid errors
+            dummy_img = np.zeros((1, IMG_SIZE, IMG_SIZE, 3))
+            dummy_label = np.zeros((1, self.labels.shape[1]))
+            return dummy_img, dummy_label
             
-            if batch_images:  # Only yield if batch is not empty
-                yield np.array(batch_images), np.array(batch_labels)
-
-# Data augmentation function
-def augment_image(image):
-    # Simple augmentation to avoid memory overhead
-    if np.random.random() > 0.5:
-        image = cv2.flip(image, 1)  # Horizontal flip
+        return np.array(batch_images), np.array(batch_labels)
     
-    if np.random.random() > 0.5:
-        image = cv2.flip(image, 0)  # Vertical flip
-    
-    return image
+    def on_epoch_end(self):
+        pass  # We shuffle at the beginning of each epoch in __getitem__
 
 def build_model():
     """Build a more memory-efficient CNN model."""
@@ -103,6 +145,11 @@ def build_model():
     
     return model
 
+def lr_schedule(epoch, lr):
+    if epoch > 5:
+        return lr * 0.5
+    return lr
+
 def main():
     """Main function with memory-efficient implementation."""
     print("Processing data...")
@@ -128,7 +175,7 @@ def main():
     indices = [label_to_index[label] for label in labels]
     one_hot_labels = np.eye(len(unique_labels))[indices]
     
-    # Calculate class weights
+    # Calculate class weights for information
     unique_classes, class_counts = np.unique(labels, return_counts=True)
     total_samples = len(labels)
     class_weights = {cls: total_samples / (len(unique_classes) * count) 
@@ -138,6 +185,7 @@ def main():
     # Implement k-fold cross-validation
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
     fold_metrics = []
+    all_histories = []
     
     for fold, (train_idx, val_idx) in enumerate(kf.split(image_paths)):
         print(f"\n=== Training fold {fold+1}/5 ===")
@@ -172,95 +220,66 @@ def main():
             mode='max',
             verbose=1
         )
+        lr_scheduler = LearningRateScheduler(lr_schedule)
         
-        # Create generators
-        train_gen = image_generator(train_paths, train_labels, BATCH_SIZE)
-        val_gen = image_generator(val_paths, val_labels, BATCH_SIZE)
-        
-        # Calculate steps per epoch
-        train_steps = len(train_paths) // BATCH_SIZE + (1 if len(train_paths) % BATCH_SIZE > 0 else 0)
-        val_steps = len(val_paths) // BATCH_SIZE + (1 if len(val_paths) % BATCH_SIZE > 0 else 0)
+        # Create custom data generators
+        train_gen = BalancedDataGenerator(train_paths, train_labels, BATCH_SIZE, augment=True)
+        val_gen = BalancedDataGenerator(val_paths, val_labels, BATCH_SIZE, augment=False)
         
         # Train model
         try:
             history = model.fit(
                 train_gen,
-                steps_per_epoch=train_steps,
                 validation_data=val_gen,
-                validation_steps=val_steps,
                 epochs=EPOCHS,
                 verbose=1,
-                class_weight=class_weights,
-                callbacks=[early_stopping, reduce_lr, checkpoint]
+                callbacks=[early_stopping, reduce_lr, checkpoint, lr_scheduler]
             )
             
-            # Compute final metrics
-            # Evaluate model on training data
-            train_results = []
-            for i in range(0, len(train_paths), BATCH_SIZE):
-                if i + BATCH_SIZE <= len(train_paths):
-                    batch_paths = train_paths[i:i + BATCH_SIZE]
-                    batch_labels = train_labels[i:i + BATCH_SIZE]
-                    
-                    # Load images
-                    batch_images = []
-                    for path in batch_paths:
-                        try:
-                            img = cv2.imread(path)
-                            if img is not None:
-                                img_resized = cv2.resize(img, (IMG_SIZE, IMG_SIZE)) / 255.0
-                                batch_images.append(img_resized)
-                        except Exception:
-                            pass
-                    
-                    if batch_images:
-                        batch_images = np.array(batch_images)
-                        batch_preds = model.predict(batch_images, verbose=0)
-                        batch_correct = np.sum(np.argmax(batch_preds, axis=1) == np.argmax(batch_labels[:len(batch_images)], axis=1))
-                        train_results.append((batch_correct, len(batch_images)))
+            all_histories.append(history.history)
             
-            train_acc = sum(correct for correct, _ in train_results) / sum(total for _, total in train_results)
+            # Plot results for this fold
+            plt.figure(figsize=(12, 4))
             
-            # Evaluate model on validation data
-            val_results = []
-            for i in range(0, len(val_paths), BATCH_SIZE):
-                if i + BATCH_SIZE <= len(val_paths):
-                    batch_paths = val_paths[i:i + BATCH_SIZE]
-                    batch_labels = val_labels[i:i + BATCH_SIZE]
-                    
-                    # Load images
-                    batch_images = []
-                    for path in batch_paths:
-                        try:
-                            img = cv2.imread(path)
-                            if img is not None:
-                                img_resized = cv2.resize(img, (IMG_SIZE, IMG_SIZE)) / 255.0
-                                batch_images.append(img_resized)
-                        except Exception:
-                            pass
-                    
-                    if batch_images:
-                        batch_images = np.array(batch_images)
-                        batch_preds = model.predict(batch_images, verbose=0)
-                        batch_correct = np.sum(np.argmax(batch_preds, axis=1) == np.argmax(batch_labels[:len(batch_images)], axis=1))
-                        val_results.append((batch_correct, len(batch_images)))
+            # Plot accuracy
+            plt.subplot(1, 2, 1)
+            plt.plot(history.history['accuracy'])
+            plt.plot(history.history['val_accuracy'])
+            plt.title(f'Model Accuracy - Fold {fold+1}')
+            plt.xlabel('Epoch')
+            plt.ylabel('Accuracy')
+            plt.legend(['Train', 'Validation'], loc='lower right')
             
-            val_acc = sum(correct for correct, _ in val_results) / sum(total for _, total in val_results)
+            # Plot loss
+            plt.subplot(1, 2, 2)
+            plt.plot(history.history['loss'])
+            plt.plot(history.history['val_loss'])
+            plt.title(f'Model Loss - Fold {fold+1}')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.legend(['Train', 'Validation'], loc='upper right')
             
+            plt.tight_layout()
+            plt.savefig(f'model_performance_fold_{fold+1}.png')
+            plt.close()
+            
+            # Store metrics for this fold
             fold_metrics.append({
-                'train_acc': train_acc,
-                'val_acc': val_acc
+                'train_acc': history.history['accuracy'][-1],
+                'val_acc': history.history['val_accuracy'][-1],
+                'train_loss': history.history['loss'][-1],
+                'val_loss': history.history['val_loss'][-1]
             })
             
             print(f"Fold {fold+1} results:")
-            print(f"  Training accuracy: {train_acc:.4f}")
-            print(f"  Validation accuracy: {val_acc:.4f}")
+            print(f"  Training accuracy: {history.history['accuracy'][-1]:.4f}")
+            print(f"  Validation accuracy: {history.history['val_accuracy'][-1]:.4f}")
             
         except Exception as e:
             print(f"Error during training fold {fold+1}: {e}")
         
         # Clean up memory
-        del model
+        del model, train_gen, val_gen
         gc.collect()
         tf.keras.backend.clear_session()
     
@@ -269,23 +288,66 @@ def main():
     for i, metrics in enumerate(fold_metrics):
         print(f"Fold {i+1}: train_acc={metrics['train_acc']:.4f}, val_acc={metrics['val_acc']:.4f}")
     
-    avg_train_acc = np.mean([m['train_acc'] for m in fold_metrics])
-    avg_val_acc = np.mean([m['val_acc'] for m in fold_metrics])
-    print(f"\nAverage train accuracy: {avg_train_acc:.4f}")
-    print(f"Average validation accuracy: {avg_val_acc:.4f}")
+    if fold_metrics:  # Check if we have metrics to average
+        avg_train_acc = np.mean([m['train_acc'] for m in fold_metrics])
+        avg_val_acc = np.mean([m['val_acc'] for m in fold_metrics])
+        print(f"\nAverage train accuracy: {avg_train_acc:.4f}")
+        print(f"Average validation accuracy: {avg_val_acc:.4f}")
+        
+        # Plot average performance across folds
+        plt.figure(figsize=(12, 4))
+        
+        # Plot average accuracy
+        plt.subplot(1, 2, 1)
+        for i, history in enumerate(all_histories):
+            plt.plot(history['accuracy'], alpha=0.3, color='blue')
+            plt.plot(history['val_accuracy'], alpha=0.3, color='orange')
+        
+        # Plot average curves
+        avg_train_acc = np.mean([history['accuracy'] for history in all_histories], axis=0)
+        avg_val_acc = np.mean([history['val_accuracy'] for history in all_histories], axis=0)
+        plt.plot(avg_train_acc, linewidth=2, color='blue')
+        plt.plot(avg_val_acc, linewidth=2, color='orange')
+        
+        plt.title('Average Model Accuracy Across Folds')
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy')
+        plt.legend(['Train', 'Validation'], loc='lower right')
+        
+        # Plot average loss
+        plt.subplot(1, 2, 2)
+        for i, history in enumerate(all_histories):
+            plt.plot(history['loss'], alpha=0.3, color='blue')
+            plt.plot(history['val_loss'], alpha=0.3, color='orange')
+        
+        # Plot average curves
+        avg_train_loss = np.mean([history['loss'] for history in all_histories], axis=0)
+        avg_val_loss = np.mean([history['val_loss'] for history in all_histories], axis=0)
+        plt.plot(avg_train_loss, linewidth=2, color='blue')
+        plt.plot(avg_val_loss, linewidth=2, color='orange')
+        
+        plt.title('Average Model Loss Across Folds')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend(['Train', 'Validation'], loc='upper right')
+        
+        plt.tight_layout()
+        plt.savefig('average_model_performance.png')
+        plt.close()
     
-    # Train final lightweight model on full dataset
+    # Train final lightweight model on full dataset with efficient memory usage
     print("\nTraining final model with subset of data...")
     
     # Use a subset of data for final model
     np.random.seed(42)
-    subset_indices = np.random.choice(len(image_paths), min(3000, len(image_paths)), replace=False)
+    max_images = 3000  # Maximum number of images to use for final model
+    subset_size = min(max_images, len(image_paths))
+    subset_indices = np.random.choice(len(image_paths), subset_size, replace=False)
     subset_paths = [image_paths[i] for i in subset_indices]
     subset_labels = one_hot_labels[subset_indices]
     
     # Create generator
-    final_gen = image_generator(subset_paths, subset_labels, BATCH_SIZE)
-    final_steps = len(subset_paths) // BATCH_SIZE + (1 if len(subset_paths) % BATCH_SIZE > 0 else 0)
+    final_gen = BalancedDataGenerator(subset_paths, subset_labels, BATCH_SIZE, augment=True)
     
     # Build and train final model
     final_model = build_model()
@@ -297,15 +359,40 @@ def main():
         verbose=1
     )
     
-    final_model.fit(
-        final_gen,
-        steps_per_epoch=final_steps,
-        epochs=EPOCHS,
-        verbose=1,
-        callbacks=[reduce_lr, final_checkpoint]
-    )
-    
-    print("Final model saved successfully!")
+    # Train with minimal memory usage
+    try:
+        final_history = final_model.fit(
+            final_gen,
+            epochs=EPOCHS,
+            verbose=1,
+            callbacks=[reduce_lr, lr_scheduler, final_checkpoint]
+        )
+        
+        # Plot final model training
+        plt.figure(figsize=(12, 4))
+        
+        # Plot accuracy
+        plt.subplot(1, 2, 1)
+        plt.plot(final_history.history['accuracy'])
+        plt.title('Final Model Accuracy')
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy')
+        
+        # Plot loss
+        plt.subplot(1, 2, 2)
+        plt.plot(final_history.history['loss'])
+        plt.title('Final Model Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        
+        plt.tight_layout()
+        plt.savefig('final_model_performance.png')
+        plt.close()
+        
+        print("Final model saved successfully!")
+        
+    except Exception as e:
+        print(f"Error training final model: {e}")
 
 if __name__ == "__main__":
     # Set memory limit for TensorFlow
@@ -322,5 +409,8 @@ if __name__ == "__main__":
     
     # Set memory limits in TensorFlow
     tf.keras.backend.set_floatx('float32')  # Use float32 instead of float64
+    
+    # Run with lower memory profile
+    os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'  # More efficient GPU memory allocator
     
     main()
