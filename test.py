@@ -13,7 +13,7 @@ from keras import layers
 from keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint, LearningRateScheduler
 from tensorflow.keras import regularizers
 
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, KFold
 from sklearn import metrics
 
 from PIL import Image
@@ -43,8 +43,17 @@ def create_dataset(images, labels, batch_size=64, shuffle=True, augment=False):
     if augment:
         # Add data augmentation if needed
         def augment_fn(image, label):
+            # Apply more aggressive augmentation
             image = tf.image.random_flip_left_right(image)
-            image = tf.image.random_brightness(image, 0.1)
+            image = tf.image.random_flip_up_down(image)
+            image = tf.image.random_brightness(image, 0.2)
+            image = tf.image.random_contrast(image, 0.7, 1.3)
+            image = tf.image.random_saturation(image, 0.7, 1.3)
+            
+            # Random crop and resize to maintain shape consistency
+            image = tf.image.random_crop(image, [int(IMG_SIZE*0.85), int(IMG_SIZE*0.85), 3])
+            image = tf.image.resize(image, [IMG_SIZE, IMG_SIZE])
+            
             return image, label
         
         dataset = dataset.map(augment_fn, num_parallel_calls=tf.data.AUTOTUNE)
@@ -101,7 +110,8 @@ def prepare_data():
                     continue
                     
                 img_resized = cv2.resize(img, (IMG_SIZE, IMG_SIZE)) / 255.0
-                x.append(img_resized)
+                img_normalize = (img_resized - np.mean(img_resized)) / np.std(img_resized)
+                x.append(img_normalize)
                 y.append(i)
             except Exception as e:
                 print(f"Error processing image {image}: {e}")
@@ -157,19 +167,19 @@ def build_model():
     # ])
     
     model = keras.models.Sequential([
-        layers.Conv2D(32, (3, 3), activation='relu', padding='same', 
-                     input_shape=(IMG_SIZE, IMG_SIZE, 3), kernel_regularizer=regularizers.l2(0.0001)),
+        layers.Conv2D(16, (3, 3), activation='relu', padding='same', 
+                     input_shape=(IMG_SIZE, IMG_SIZE, 3), kernel_regularizer=regularizers.l2(0.001)),
         layers.BatchNormalization(),
         layers.MaxPooling2D(2, 2),
         
-        layers.Conv2D(64, (3, 3), activation='relu', padding='same', kernel_regularizer=regularizers.l2(0.0001)),
+        layers.Conv2D(32, (3, 3), activation='relu', padding='same', kernel_regularizer=regularizers.l2(0.001)),
         layers.BatchNormalization(),
         layers.MaxPooling2D(2, 2),
         
         layers.Flatten(),
-        layers.Dense(128, activation='relu'),
+        layers.Dense(64, activation='relu'),
         layers.BatchNormalization(),
-        layers.Dropout(0.5),  # Increased dropout
+        layers.Dropout(0.7),  # Increased dropout
         layers.Dense(3, activation='softmax')
     ])
 
@@ -203,74 +213,162 @@ def lr_schedule(epoch, lr):
     return lr
 
 def main():
-    """Main function to run the training pipeline."""
+    """Main function to run the training pipeline with cross-validation."""
     # Prepare data
     print("Loading and preparing data...")
-    x_train, x_val, y_train, y_val = prepare_data()
+    x, y = [], []
     
-    # Create datasets
-    print("Creating TensorFlow datasets...")
-    train_dataset = create_dataset(x_train, y_train, batch_size=BATCH_SIZE, augment=True)
-    val_dataset = create_dataset(x_val, y_val, batch_size=BATCH_SIZE, shuffle=False)
+    catalogs = sorted(os.listdir(PATH))
+    print(f"Categories found: {catalogs}")
     
-    # Build model
-    print("Building model...")
-    model = build_model()
-    model.summary()
+    for i, catalog in enumerate(catalogs):
+        images = glob(f"{PATH}/{catalog}/*.jpeg")
+        print(f"Found {len(images)} images in category {catalog}")
+        
+        sample_size = min(len(images), 500)
+        for image in images[:sample_size]:
+            try:
+                img = cv2.imread(image)
+                if img is None:
+                    continue
+                    
+                img_resized = cv2.resize(img, (IMG_SIZE, IMG_SIZE)) / 255.0
+                # Optional: Add normalization
+                # img_normalized = (img_resized - np.mean(img_resized)) / np.std(img_resized)
+                # x.append(img_normalized)
+                x.append(img_resized)
+                y.append(i)
+            except Exception as e:
+                print(f"Error processing image {image}: {e}")
+                continue
     
-    # Set up callbacks
-    accuracy_callback = AccuracyCallback(threshold=0.9)
-    early_stopping = EarlyStopping(
-        patience=3,
-        monitor='val_accuracy',
-        restore_best_weights=True
-    )
-    reduce_lr = ReduceLROnPlateau(
-        monitor='val_loss',
-        patience=2,
-        factor=0.5,
-        verbose=1
-    )
-    checkpoint = ModelCheckpoint(
-        'best_model.keras',
-        monitor='val_accuracy',
+    x = np.asarray(x)
+    y = np.array(y)
+
+    one_hot_encoded_y = pd.get_dummies(y).values
+    
+    print(f"Data shape: {x.shape}, Labels shape: {one_hot_encoded_y.shape}")
+    
+    # Calculate class weights
+    unique_classes, class_counts = np.unique(y, return_counts=True)
+    total_samples = len(y)
+
+    class_weights = {cls: total_samples / (len(unique_classes) * count) 
+                    for cls, count in zip(unique_classes, class_counts)}
+    print(f"Class weights: {class_weights}")
+    
+    # Implement k-fold cross-validation
+    from sklearn.model_selection import KFold
+    
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    fold_metrics = []
+    
+    for fold, (train_idx, val_idx) in enumerate(kf.split(x)):
+        print(f"\n=== Training fold {fold+1}/5 ===")
+        
+        # Split data for this fold
+        x_train, x_val = x[train_idx], x[val_idx]
+        y_train, y_val = one_hot_encoded_y[train_idx], one_hot_encoded_y[val_idx]
+        
+        # Create datasets
+        train_dataset = create_dataset(x_train, y_train, batch_size=BATCH_SIZE, augment=True)
+        val_dataset = create_dataset(x_val, y_val, batch_size=BATCH_SIZE, shuffle=False)
+        
+        # Build model
+        model = build_model()
+        if fold == 0:  # Only show summary for first fold
+            model.summary()
+        
+        # Set up callbacks
+        accuracy_callback = AccuracyCallback(threshold=0.9)
+        early_stopping = EarlyStopping(
+            patience=3,
+            monitor='val_accuracy',
+            restore_best_weights=True
+        )
+        reduce_lr = ReduceLROnPlateau(
+            monitor='val_loss',
+            patience=2,
+            factor=0.5,
+            verbose=1
+        )
+        checkpoint = ModelCheckpoint(
+            f'best_model_fold_{fold+1}.keras',
+            monitor='val_accuracy',
+            save_best_only=True,
+            mode='max',
+            verbose=1
+        )
+        lr_scheduler = LearningRateScheduler(lr_schedule)
+        
+        # Train model
+        try:
+            history = model.fit(
+                train_dataset,
+                validation_data=val_dataset,
+                epochs=EPOCHS,
+                verbose=1,
+                class_weight=class_weights,  # Add class weights
+                callbacks=[early_stopping, reduce_lr, accuracy_callback, checkpoint, lr_scheduler]
+            )
+            
+            # Plot results for this fold
+            history_df = pd.DataFrame(history.history)
+            plt.figure(figsize=(10, 6))
+            history_df.loc[:, ['accuracy', 'val_accuracy']].plot()
+            plt.title(f'Model Accuracy - Fold {fold+1}')
+            plt.xlabel('Epoch')
+            plt.ylabel('Accuracy')
+            plt.legend(['Train', 'Validation'], loc='upper left')
+            plt.savefig(f'model_accuracy_fold_{fold+1}.png')
+            plt.close()
+            
+            # Store metrics for this fold
+            fold_metrics.append({
+                'train_acc': history.history['accuracy'][-1],
+                'val_acc': history.history['val_accuracy'][-1],
+                'train_loss': history.history['loss'][-1],
+                'val_loss': history.history['val_loss'][-1]
+            })
+            
+            print(f"Fold {fold+1} results:")
+            print(f"  Training accuracy: {history.history['accuracy'][-1]:.4f}")
+            print(f"  Validation accuracy: {history.history['val_accuracy'][-1]:.4f}")
+            
+        except Exception as e:
+            print(f"Error during training fold {fold+1}: {e}")
+    
+    # Summarize cross-validation results
+    print("\n=== Cross-validation results ===")
+    for i, metrics in enumerate(fold_metrics):
+        print(f"Fold {i+1}: train_acc={metrics['train_acc']:.4f}, val_acc={metrics['val_acc']:.4f}")
+    
+    avg_train_acc = np.mean([m['train_acc'] for m in fold_metrics])
+    avg_val_acc = np.mean([m['val_acc'] for m in fold_metrics])
+    print(f"\nAverage train accuracy: {avg_train_acc:.4f}")
+    print(f"Average validation accuracy: {avg_val_acc:.4f}")
+    
+    # Train final model on all data if desired
+    print("\n=== Training final model on all data ===")
+    final_dataset = create_dataset(x, one_hot_encoded_y, batch_size=BATCH_SIZE, augment=True)
+    final_model = build_model()
+    
+    final_checkpoint = ModelCheckpoint(
+        'final_model.keras',
+        monitor='accuracy',
         save_best_only=True,
         mode='max',
         verbose=1
     )
-    lr_scheduler = LearningRateScheduler(lr_schedule)
     
-    # Train model
-    print("Starting training...")
-    try:
-        history = model.fit(
-            train_dataset,
-            validation_data=val_dataset,
-            epochs=EPOCHS,
-            verbose=1,
-            callbacks=[early_stopping, reduce_lr, accuracy_callback, checkpoint, lr_scheduler]
-        )
-        
-        # Plot results
-        history_df = pd.DataFrame(history.history)
-        history_df.loc[:, ['accuracy', 'val_accuracy']].plot()
-        plt.title('Model Accuracy')
-        plt.xlabel('Epoch')
-        plt.ylabel('Accuracy')
-        plt.legend(['Train', 'Validation'], loc='upper left')
-        plt.savefig('model_accuracy_plots_new/model_accuracy.png')
-        plt.show()
-
-        print("\nTraining Results:")
-        print(f"Final training accuracy: {history.history['accuracy'][-1]:.4f}")
-        print(f"Final validation accuracy: {history.history['val_accuracy'][-1]:.4f}")
-        
-        # Save model
-        model.save('lung_image_classifier.keras')
-        print("Model saved successfully!")
-        
-    except Exception as e:
-        print(f"Error during training: {e}")
+    final_model.fit(
+        final_dataset,
+        epochs=EPOCHS,
+        verbose=1,
+        callbacks=[reduce_lr, lr_scheduler, final_checkpoint]
+    )
+    
+    print("Final model saved successfully!")
 
 if __name__ == "__main__":
     # Set memory limit for TensorFlow
