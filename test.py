@@ -222,7 +222,7 @@ def main():
         plt.show()
         
         # Save model
-        model.save('lung_image_classifier.h5')
+        model.save('lung_image_classifier.keras')
         print("Model saved successfully!")
         
     except Exception as e:
